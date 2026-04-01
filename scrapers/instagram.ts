@@ -1,168 +1,144 @@
 /**
- * Instagram Graph API scraper.
+ * Instagram scraper via Apify's Instagram Hashtag Scraper actor.
  *
- * Searches relevant hashtags for event posts in the Historic Core neighborhood.
- * Uses the official Instagram Graph API hashtag search endpoint.
+ * Uses no Instagram or Facebook account — just an Apify API key.
  *
- * Setup:
- *  1. Create a Meta Developer app at https://developers.facebook.com/
- *  2. Add the Instagram product and connect an Instagram Business/Creator account
- *  3. Generate a long-lived User Access Token (valid 60 days — store and refresh it)
- *  4. Set INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_BUSINESS_ACCOUNT_ID in .env.local
+ * Setup (5 minutes):
+ *  1. Sign up at https://apify.com (free — $5 compute credits/month included)
+ *  2. Go to https://console.apify.com/account/integrations → copy your API token
+ *  3. Set APIFY_API_TOKEN in .env.local
  *
- * Docs: https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-hashtag-search
+ * The free tier comfortably covers one weekly run (~0.05–0.10 USD per run).
  *
- * Rate limits:
- *  - 30 UNIQUE hashtag searches per 7-day rolling window per account
- *  - Hashtag IDs are stable and cacheable — we store them in data/hashtag-cache.json
- *    so we only consume the 30/week budget once per hashtag (not on every run)
- *  - 200 API calls per hour
+ * Actor docs: https://apify.com/apify/instagram-hashtag-scraper
  */
 
-import fs from "fs";
-import path from "path";
 import { normalizeInstagram, type IgRawPost } from "../lib/normalize";
 import type { NormalizedEvent } from "../lib/types";
 
-// ---------------------------------------------------------------------------
-// Hashtags to search — ordered by relevance to Historic Core LA events
-// We search up to 10 per run; caching means the 30/week limit isn't a concern
-// after the first run.
-// ---------------------------------------------------------------------------
+// Hashtags to search — ordered by relevance to Historic Core LA
 const HASHTAGS = [
-  "historiccorela",      // most specific
-  "historiccore",        // BID's own tag
-  "historiccorebtd",     // sometimes used by the BID
-  "dtlaevents",          // broad DTLA events
-  "downtownlaevents",
-  "dtla",                // very broad, filter aggressively by caption
+  "historiccorela",
+  "historiccore",
   "historiccoredtla",
+  "dtlaevents",
+  "downtownlaevents",
   "springstreetdtla",
   "broadwaydtla",
   "happeningindtla",
+  "dtla",
 ];
 
-// Only posts whose captions contain at least one of these keywords are kept
-// when searching broad hashtags (like #dtla).
+// For broad tags like #dtla we require at least one event keyword in the caption
 const EVENT_KEYWORDS = [
   "event", "join us", "happening", "come out", "pop-up", "popup",
   "opening", "exhibition", "show", "concert", "performance", "market",
   "festival", "workshop", "tour", "walk", "admission", "rsvp", "tickets",
   "doors open", "live music", "art night", "gallery", "free entry",
 ];
+const BROAD_HASHTAGS = new Set(["dtla"]);
 
-const GRAPH_API_BASE = "https://graph.facebook.com/v19.0";
+const APIFY_BASE = "https://api.apify.com/v2";
 
 // ---------------------------------------------------------------------------
-// Hashtag ID cache — persisted to disk so we don't burn through the 30/week limit
+// Apify run helpers
 // ---------------------------------------------------------------------------
 
-const CACHE_PATH = path.resolve(process.env.DATABASE_PATH ?? "./data/events.db", "../hashtag-cache.json");
-
-interface HashtagCache {
-  [hashtag: string]: { id: string; cachedAt: number };
+interface ApifyRunResponse {
+  data: { id: string; status: string };
 }
 
-function loadCache(): HashtagCache {
-  try {
-    if (fs.existsSync(CACHE_PATH)) {
-      return JSON.parse(fs.readFileSync(CACHE_PATH, "utf-8")) as HashtagCache;
+interface ApifyDatasetItem {
+  id?: string;
+  shortCode?: string;
+  caption?: string;
+  timestamp?: string;
+  url?: string;
+  displayUrl?: string;
+  images?: string[];
+  videoUrl?: string;
+  ownerUsername?: string;
+  locationName?: string;
+}
+
+async function startRun(apiToken: string): Promise<string> {
+  const res = await fetch(
+    `${APIFY_BASE}/acts/apify~instagram-hashtag-scraper/runs?token=${apiToken}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        hashtags: HASHTAGS,
+        resultsLimit: 30,  // per hashtag
+        expandOwners: false,
+      }),
     }
-  } catch { /* ignore */ }
-  return {};
-}
+  );
 
-function saveCache(cache: HashtagCache): void {
-  try {
-    fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true });
-    fs.writeFileSync(CACHE_PATH, JSON.stringify(cache, null, 2));
-  } catch (err) {
-    console.warn("[instagram] Could not save hashtag cache:", err);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// API helpers
-// ---------------------------------------------------------------------------
-
-async function getHashtagId(
-  hashtag: string,
-  accountId: string,
-  accessToken: string,
-  cache: HashtagCache
-): Promise<string | null> {
-  // Return from cache if available (no expiry — hashtag IDs are stable)
-  if (cache[hashtag]) {
-    return cache[hashtag].id;
-  }
-
-  const params = new URLSearchParams({
-    user_id: accountId,
-    q: hashtag,
-    access_token: accessToken,
-  });
-
-  const res = await fetch(`${GRAPH_API_BASE}/ig_hashtag_search?${params}`);
   if (!res.ok) {
     const body = await res.text();
-    console.warn(`[instagram] Could not get ID for #${hashtag}: HTTP ${res.status} — ${body}`);
-    return null;
+    throw new Error(`Apify start run failed: HTTP ${res.status} — ${body}`);
   }
 
-  const data = await res.json() as { data?: Array<{ id: string }>; error?: { message: string } };
-  if (data.error) {
-    console.warn(`[instagram] API error for #${hashtag}: ${data.error.message}`);
-    return null;
-  }
-
-  const id = data.data?.[0]?.id;
-  if (!id) return null;
-
-  cache[hashtag] = { id, cachedAt: Date.now() };
-  return id;
+  const data: ApifyRunResponse = await res.json();
+  return data.data.id;
 }
 
-interface IgMediaResponse {
-  data?: Array<{
-    id: string;
-    caption?: string;
-    timestamp: string;
-    permalink: string;
-    media_url?: string;
-    thumbnail_url?: string;
-    username?: string;
-  }>;
-  paging?: { next?: string };
-  error?: { message: string };
+async function pollUntilFinished(runId: string, apiToken: string): Promise<void> {
+  const maxWaitMs = 5 * 60 * 1000; // 5 minutes
+  const pollInterval = 5000;        // 5 seconds
+  const deadline = Date.now() + maxWaitMs;
+
+  while (Date.now() < deadline) {
+    await sleep(pollInterval);
+
+    const res = await fetch(`${APIFY_BASE}/actor-runs/${runId}?token=${apiToken}`);
+    if (!res.ok) continue;
+
+    const data = await res.json() as { data: { status: string } };
+    const status = data.data.status;
+
+    if (status === "SUCCEEDED") return;
+    if (status === "FAILED" || status === "ABORTED" || status === "TIMED-OUT") {
+      throw new Error(`Apify run ${runId} ended with status: ${status}`);
+    }
+
+    console.log(`[instagram] Run ${runId} status: ${status} — waiting…`);
+  }
+
+  throw new Error("Apify run timed out after 5 minutes");
 }
 
-async function getRecentMedia(
-  hashtagId: string,
-  accountId: string,
-  accessToken: string
-): Promise<IgRawPost[]> {
-  const params = new URLSearchParams({
-    user_id: accountId,
-    fields: "id,caption,timestamp,permalink,media_url,thumbnail_url,username",
-    access_token: accessToken,
-    limit: "50",
-  });
+async function fetchDataset(runId: string, apiToken: string): Promise<ApifyDatasetItem[]> {
+  const res = await fetch(
+    `${APIFY_BASE}/actor-runs/${runId}/dataset/items?token=${apiToken}&format=json&clean=true`
+  );
+  if (!res.ok) throw new Error(`Apify dataset fetch failed: HTTP ${res.status}`);
+  return res.json() as Promise<ApifyDatasetItem[]>;
+}
 
-  const url = `${GRAPH_API_BASE}/${hashtagId}/recent_media?${params}`;
-  const res = await fetch(url);
+// ---------------------------------------------------------------------------
+// Map Apify item → IgRawPost
+// ---------------------------------------------------------------------------
 
-  if (!res.ok) {
-    console.warn(`[instagram] recent_media HTTP ${res.status}`);
-    return [];
-  }
+function toIgRawPost(item: ApifyDatasetItem): IgRawPost | null {
+  const id = item.id ?? item.shortCode;
+  if (!id || !item.timestamp) return null;
 
-  const data: IgMediaResponse = await res.json();
-  if (data.error) {
-    console.warn(`[instagram] recent_media error: ${data.error.message}`);
-    return [];
-  }
+  const permalink =
+    item.url ??
+    (item.shortCode ? `https://www.instagram.com/p/${item.shortCode}/` : null);
+  if (!permalink) return null;
 
-  return (data.data ?? []) as IgRawPost[];
+  return {
+    id,
+    caption: item.caption ?? undefined,
+    timestamp: item.timestamp,
+    permalink,
+    media_url: item.displayUrl ?? item.images?.[0] ?? undefined,
+    thumbnail_url: item.videoUrl ? item.displayUrl : undefined,
+    username: item.ownerUsername ?? undefined,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,78 +149,78 @@ export async function fetchInstagram(
   weekStart: Date,
   weekEnd: Date
 ): Promise<NormalizedEvent[]> {
-  const accessToken = process.env.INSTAGRAM_ACCESS_TOKEN;
-  const accountId = process.env.INSTAGRAM_BUSINESS_ACCOUNT_ID;
+  const apiToken = process.env.APIFY_API_TOKEN;
 
-  if (!accessToken || !accountId) {
+  if (!apiToken) {
     console.warn(
-      "[instagram] INSTAGRAM_ACCESS_TOKEN and/or INSTAGRAM_BUSINESS_ACCOUNT_ID not set — skipping.\n" +
-      "           See scrapers/instagram.ts for setup instructions."
+      "[instagram] APIFY_API_TOKEN not set — skipping Instagram.\n" +
+      "           Sign up free at https://apify.com and add your token to .env.local"
     );
     return [];
   }
 
-  const cache = loadCache();
-  const seen = new Set<string>();
-  const results: NormalizedEvent[] = [];
+  console.log(`[instagram] Starting Apify run for ${HASHTAGS.length} hashtags…`);
+
+  let runId: string;
+  try {
+    runId = await startRun(apiToken);
+    console.log(`[instagram] Run started: ${runId}`);
+    await pollUntilFinished(runId, apiToken);
+    console.log(`[instagram] Run completed.`);
+  } catch (err) {
+    console.error("[instagram] Apify run failed:", err);
+    return [];
+  }
+
+  let items: ApifyDatasetItem[];
+  try {
+    items = await fetchDataset(runId, apiToken);
+  } catch (err) {
+    console.error("[instagram] Failed to fetch dataset:", err);
+    return [];
+  }
+
+  console.log(`[instagram] Dataset contains ${items.length} posts.`);
 
   const weekStartTs = Math.floor(weekStart.getTime() / 1000);
   const weekEndTs = Math.floor(weekEnd.getTime() / 1000);
-  // Look back 14 days for posts — event posts often appear before the event
-  const lookbackTs = weekStartTs - 14 * 86400;
+  const lookbackTs = weekStartTs - 14 * 86400; // 2 weeks back for advance posts
 
-  for (const hashtag of HASHTAGS) {
-    console.log(`[instagram] Searching #${hashtag}…`);
+  const seen = new Set<string>();
+  const results: NormalizedEvent[] = [];
 
-    const hashtagId = await getHashtagId(hashtag, accountId, accessToken, cache);
-    if (!hashtagId) {
-      await sleep(500);
+  for (const item of items) {
+    const post = toIgRawPost(item);
+    if (!post || seen.has(post.id)) continue;
+
+    const postTs = Math.floor(new Date(post.timestamp).getTime() / 1000);
+    if (postTs < lookbackTs) continue;
+
+    const caption = (post.caption ?? "").toLowerCase();
+    if (caption.length < 30) continue;
+
+    // Determine which hashtag brought this post in (Apify doesn't tag items by hashtag,
+    // so check the caption/item for broad-hashtag filtering)
+    const isFromBroadHashtag =
+      BROAD_HASHTAGS.has("dtla") &&
+      !HASHTAGS.slice(0, -1).some((h) => caption.includes(h)); // not from a specific tag
+    if (isFromBroadHashtag && !EVENT_KEYWORDS.some((kw) => caption.includes(kw))) {
       continue;
     }
 
-    const posts = await getRecentMedia(hashtagId, accountId, accessToken);
+    const normalized = normalizeInstagram(post);
+    const dateIsInWeek =
+      normalized.start_time >= weekStartTs && normalized.start_time <= weekEndTs;
+    const isRecentPost = postTs >= weekStartTs - 7 * 86400 && postTs <= weekEndTs;
+    const dateIsFallback = normalized.start_time === postTs;
 
-    // For broad hashtags, filter by event keywords
-    const isBroadHashtag = ["dtla"].includes(hashtag);
-
-    for (const post of posts) {
-      if (seen.has(post.id)) continue;
-
-      const postTs = Math.floor(new Date(post.timestamp).getTime() / 1000);
-
-      // Only look at posts published within the lookback window
-      if (postTs < lookbackTs) continue;
-
-      const caption = (post.caption ?? "").toLowerCase();
-
-      // Skip posts with no caption or very short captions (ads, selfies, etc.)
-      if (caption.length < 30) continue;
-
-      // For broad hashtags, require event keywords
-      if (isBroadHashtag && !EVENT_KEYWORDS.some((kw) => caption.includes(kw))) {
-        continue;
-      }
-
-      const normalized = normalizeInstagram(post);
-
-      // Keep events whose parsed date falls in the week, or posts from the last 7 days
-      // if we couldn't parse a date (start_time fell back to post timestamp)
-      const dateIsInWeek = normalized.start_time >= weekStartTs && normalized.start_time <= weekEndTs;
-      const isRecentPost = postTs >= weekStartTs - 7 * 86400 && postTs <= weekEndTs;
-      const dateIsFallback = normalized.start_time === postTs; // we didn't parse a real date
-
-      if (dateIsInWeek || (isRecentPost && dateIsFallback)) {
-        seen.add(post.id);
-        results.push(normalized);
-      }
+    if (dateIsInWeek || (isRecentPost && dateIsFallback)) {
+      seen.add(post.id);
+      results.push(normalized);
     }
-
-    // Save cache after each successful hashtag lookup
-    saveCache(cache);
-    await sleep(300);
   }
 
-  console.log(`[instagram] Found ${results.length} event posts.`);
+  console.log(`[instagram] Kept ${results.length} event posts after filtering.`);
   return results;
 }
 
