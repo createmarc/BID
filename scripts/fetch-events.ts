@@ -15,6 +15,7 @@ import { fetchTicketmaster } from "../scrapers/ticketmaster";
 import { fetchSerpApi } from "../scrapers/serpapi";
 import { fetchEventbrite } from "../scrapers/eventbrite";
 import { fetchHistoricCore } from "../scrapers/historiccore";
+import { fetchInstagram } from "../scrapers/instagram";
 import { upsertEvents, countEvents } from "../lib/db";
 import { getWeekStart, getWeekEnd, shiftWeek } from "../lib/weeks";
 
@@ -45,6 +46,7 @@ async function main() {
       fetchSerpApi(weekStart, weekEnd),
       fetchEventbrite(weekStart, weekEnd),
       fetchHistoricCore(weekStart, weekEnd),
+      fetchInstagram(weekStart, weekEnd),
     ]);
 
     const allEvents = results.flatMap((r) =>

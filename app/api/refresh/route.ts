@@ -3,6 +3,7 @@ import { fetchTicketmaster } from "@/scrapers/ticketmaster";
 import { fetchSerpApi } from "@/scrapers/serpapi";
 import { fetchEventbrite } from "@/scrapers/eventbrite";
 import { fetchHistoricCore } from "@/scrapers/historiccore";
+import { fetchInstagram } from "@/scrapers/instagram";
 import { upsertEvents } from "@/lib/db";
 import { getWeekStart, getWeekEnd } from "@/lib/weeks";
 
@@ -25,6 +26,7 @@ export async function POST(req: NextRequest) {
     fetchSerpApi(monday, weekEnd),
     fetchEventbrite(monday, weekEnd),
     fetchHistoricCore(monday, weekEnd),
+    fetchInstagram(monday, weekEnd),
   ]);
 
   const allEvents = results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
@@ -35,6 +37,7 @@ export async function POST(req: NextRequest) {
     serpapi: results[1].status === "fulfilled" ? results[1].value.length : 0,
     eventbrite: results[2].status === "fulfilled" ? results[2].value.length : 0,
     historiccore: results[3].status === "fulfilled" ? results[3].value.length : 0,
+    instagram: results[4].status === "fulfilled" ? results[4].value.length : 0,
   };
 
   return NextResponse.json({

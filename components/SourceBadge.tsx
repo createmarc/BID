@@ -5,6 +5,7 @@ const SOURCE_CONFIG: Record<EventSource, { label: string; color: string }> = {
   serpapi: { label: "Google Events", color: "bg-green-100 text-green-700" },
   eventbrite: { label: "Eventbrite", color: "bg-orange-100 text-orange-700" },
   historiccore: { label: "Historic Core", color: "bg-yellow-100 text-yellow-800" },
+  instagram: { label: "Instagram", color: "bg-pink-100 text-pink-700" },
 };
 
 export default function SourceBadge({ source }: { source: EventSource }) {

@@ -210,3 +210,196 @@ function parseHcDate(text: string): number {
   // Fallback to now
   return Math.floor(Date.now() / 1000);
 }
+
+// ---------------------------------------------------------------------------
+// Instagram
+// ---------------------------------------------------------------------------
+
+export interface IgRawPost {
+  id: string;
+  caption?: string;
+  timestamp: string;      // ISO 8601 — when the post was published
+  permalink: string;
+  media_url?: string;
+  thumbnail_url?: string; // for VIDEO posts
+  username?: string;
+}
+
+/**
+ * Parse an Instagram post into a NormalizedEvent.
+ * Since IG posts don't have structured event fields, we attempt to extract
+ * date/time from the caption text using common posting patterns.
+ * Falls back to the post's publish timestamp if nothing parseable is found.
+ */
+export function normalizeInstagram(raw: IgRawPost): NormalizedEvent {
+  const caption = raw.caption ?? "";
+  const title = extractIgTitle(caption) ?? `Event posted by @${raw.username ?? "historiccore"}`;
+  const { startTime, endTime } = parseIgDateTime(caption, raw.timestamp);
+  const location = extractIgLocation(caption);
+  const price = extractIgPrice(caption);
+  const imageUrl = raw.thumbnail_url ?? raw.media_url ?? null;
+
+  return {
+    id: makeId("instagram", raw.id, startTime),
+    source: "instagram",
+    title,
+    description: caption.slice(0, 500) || null,
+    start_time: startTime,
+    end_time: endTime,
+    venue_name: location?.venueName ?? null,
+    address: location?.address ?? null,
+    url: raw.permalink,
+    image_url: imageUrl,
+    price_range: price,
+    fetched_at: now(),
+  };
+}
+
+/**
+ * Extract a title from an Instagram caption.
+ * Looks for the first substantive line (after stripping emoji-only lines).
+ */
+function extractIgTitle(caption: string): string | null {
+  const lines = caption.split("\n").map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    // Skip lines that are just hashtags, emoji, or very short
+    const stripped = line.replace(/#\w+/g, "").replace(/[^\w\s.,!?'"()-]/g, "").trim();
+    if (stripped.length >= 10) return stripped.slice(0, 100);
+  }
+  return null;
+}
+
+const MONTHS: Record<string, number> = {
+  january: 0, jan: 0,
+  february: 1, feb: 1,
+  march: 2, mar: 2,
+  april: 3, apr: 3,
+  may: 4,
+  june: 5, jun: 5,
+  july: 6, jul: 6,
+  august: 7, aug: 7,
+  september: 8, sep: 8, sept: 8,
+  october: 9, oct: 9,
+  november: 10, nov: 10,
+  december: 11, dec: 11,
+};
+
+/**
+ * Try to parse a date + time from a caption.
+ * Supports common patterns found in LA event posts:
+ *   📅 Saturday, April 5th
+ *   April 5 | 7pm – 10pm
+ *   4/5 at 7:00 PM
+ *   this Saturday at 6pm
+ */
+function parseIgDateTime(
+  caption: string,
+  fallbackIso: string
+): { startTime: number; endTime: number | null } {
+  const fallback = Math.floor(new Date(fallbackIso).getTime() / 1000);
+  const text = caption.toLowerCase().replace(/[📅🗓️]/g, "");
+  const currentYear = new Date().getFullYear();
+
+  // Pattern 1: "April 5" or "April 5th" optionally followed by time
+  for (const [month, monthIdx] of Object.entries(MONTHS)) {
+    const re = new RegExp(
+      `\\b${month}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:[,\\s]+(?:at\\s+)?(\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)))?`,
+      "i"
+    );
+    const m = text.match(re);
+    if (m) {
+      const day = parseInt(m[1], 10);
+      const d = new Date(currentYear, monthIdx, day);
+      if (!isNaN(d.getTime())) {
+        if (m[2]) applyTimeStr(d, m[2]);
+        const startTime = Math.floor(d.getTime() / 1000);
+        const endTime = extractEndTime(text, d);
+        return { startTime, endTime };
+      }
+    }
+  }
+
+  // Pattern 2: MM/DD or MM-DD optionally followed by time
+  const slashDate = text.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-]\d{2,4})?\b/);
+  if (slashDate) {
+    const d = new Date(currentYear, parseInt(slashDate[1], 10) - 1, parseInt(slashDate[2], 10));
+    if (!isNaN(d.getTime())) {
+      const timeAfter = text.slice(text.indexOf(slashDate[0]) + slashDate[0].length);
+      const timeM = timeAfter.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+      if (timeM) applyTimeStr(d, timeM[1]);
+      return { startTime: Math.floor(d.getTime() / 1000), endTime: extractEndTime(text, d) };
+    }
+  }
+
+  // Pattern 3: "this saturday", "next friday" etc.
+  const relDay = text.match(/\b(this|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i);
+  if (relDay) {
+    const d = relativeDay(relDay[1], relDay[2]);
+    if (d) {
+      const timeM = text.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+      if (timeM) applyTimeStr(d, timeM[1]);
+      return { startTime: Math.floor(d.getTime() / 1000), endTime: extractEndTime(text, d) };
+    }
+  }
+
+  return { startTime: fallback, endTime: null };
+}
+
+function applyTimeStr(d: Date, timeStr: string): void {
+  const m = timeStr.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+  if (!m) return;
+  let hours = parseInt(m[1], 10);
+  const minutes = m[2] ? parseInt(m[2], 10) : 0;
+  const ampm = m[3].toLowerCase();
+  if (ampm === "pm" && hours < 12) hours += 12;
+  if (ampm === "am" && hours === 12) hours = 0;
+  d.setHours(hours, minutes, 0, 0);
+}
+
+function extractEndTime(text: string, startDate: Date): number | null {
+  // Look for "– 10pm", "to 10pm", "- 10:00 PM"
+  const m = text.match(/(?:–|-|to)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm))/i);
+  if (!m) return null;
+  const end = new Date(startDate.getTime());
+  applyTimeStr(end, m[1]);
+  // If end is before start, it's midnight-crossing — add a day
+  if (end.getTime() <= startDate.getTime()) end.setDate(end.getDate() + 1);
+  return Math.floor(end.getTime() / 1000);
+}
+
+function relativeDay(rel: string, dayName: string): Date | null {
+  const days = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const target = days.indexOf(dayName.toLowerCase());
+  if (target === -1) return null;
+  const today = new Date();
+  const todayDay = today.getDay();
+  let diff = target - todayDay;
+  if (rel.toLowerCase() === "next" || diff <= 0) diff += 7;
+  const d = new Date(today);
+  d.setDate(today.getDate() + diff);
+  return d;
+}
+
+function extractIgLocation(caption: string): { venueName: string | null; address: string | null } | null {
+  // Look for 📍 emoji followed by location text
+  const m = caption.match(/📍\s*(.+?)(?:\n|$)/);
+  if (m) {
+    const loc = m[1].trim();
+    // If it contains a street address, use it as address; otherwise venue name
+    const hasStreet = /\d+\s+\w+\s+(st|ave|blvd|dr|ln|rd|way|pl)\b/i.test(loc);
+    return {
+      venueName: hasStreet ? null : loc.slice(0, 80),
+      address: hasStreet ? loc.slice(0, 120) : null,
+    };
+  }
+  return null;
+}
+
+function extractIgPrice(caption: string): string | null {
+  const lower = caption.toLowerCase();
+  if (/\bfree\b/.test(lower) && /\badmission\b|\bentry\b|\bevent\b/.test(lower)) return "Free";
+  if (/\bfree admission\b|\bfree entry\b/.test(lower)) return "Free";
+  const priceM = caption.match(/\$(\d+(?:\.\d{2})?)/);
+  if (priceM) return `$${priceM[1]}`;
+  return null;
+}

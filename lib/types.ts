@@ -1,4 +1,4 @@
-export type EventSource = "ticketmaster" | "serpapi" | "eventbrite" | "historiccore";
+export type EventSource = "ticketmaster" | "serpapi" | "eventbrite" | "historiccore" | "instagram";
 
 export interface NormalizedEvent {
   /** SHA-256 hash of (source + title.toLowerCase() + toDateString(start_time)) */
